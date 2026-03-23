@@ -29,6 +29,7 @@ fra DMI-dataene.
 
 from __future__ import annotations
 
+import os
 import math
 import time
 from dataclasses import dataclass
@@ -941,15 +942,19 @@ def main() -> None:
     else:
         print(disagreement_df.head(10).to_string(index=False))
 
-    station_ranking.to_csv("dmi_station_ranking.csv", index=False)
-    raw_best_dataset.to_csv("dmi_best_station_raw_4x_daily.csv", index=False)
-    clean_df.to_csv("dmi_copenhagen_clean_4x_daily.csv", index=False)
-    feat_df.to_csv("dmi_copenhagen_features_4x_daily.csv", index=False)
-    pred_df.to_csv("dmi_qbc_temperature_predictions.csv", index=False)
-    learning_curve_df.to_csv("dmi_qbc_learning_curve.csv", index=False)
-    disagreement_df.to_csv("dmi_qbc_pool_disagreement.csv", index=False)
-    qbc_result.final_pool_predictions.to_csv("dmi_qbc_final_pool_predictions.csv", index=False)
-    qbc_result.final_selected_points.to_csv("dmi_qbc_selected_points.csv", index=False)
+
+    # Create the folder automatically if it doesn't exist
+    os.makedirs("data", exist_ok=True)
+
+    station_ranking.to_csv("data/dmi_station_ranking.csv", index=False)
+    raw_best_dataset.to_csv("data/dmi_best_station_raw_4x_daily.csv", index=False)
+    clean_df.to_csv("data/dmi_copenhagen_clean_4x_daily.csv", index=False)
+    feat_df.to_csv("data/dmi_copenhagen_features_4x_daily.csv", index=False)
+    pred_df.to_csv("data/dmi_qbc_temperature_predictions.csv", index=False)
+    learning_curve_df.to_csv("data/dmi_qbc_learning_curve.csv", index=False)
+    disagreement_df.to_csv("data/dmi_qbc_pool_disagreement.csv", index=False)
+    qbc_result.final_pool_predictions.to_csv("data/dmi_qbc_final_pool_predictions.csv", index=False)
+    qbc_result.final_selected_points.to_csv("data/dmi_qbc_selected_points.csv", index=False)
 
     print("\nFiler gemt:")
     print("  - dmi_station_ranking.csv")
