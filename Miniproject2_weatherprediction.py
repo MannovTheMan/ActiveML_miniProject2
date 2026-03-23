@@ -40,6 +40,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import requests
+from tqdm import tqdm
 from sklearn.base import clone
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor
 from sklearn.impute import SimpleImputer
@@ -84,6 +85,15 @@ MAX_STATION_CANDIDATES = 20
 
 # Sæt True hvis I kun vil bruge manuelt QC'ede data
 MANUAL_QC_ONLY = False
+
+# Standardization factors for normalized error metrics
+# Used to normalize each variable's error by its typical range/variability
+STANDARDIZATION_FACTORS: Dict[str, float] = {
+    "temperature_c": 5.0,           # °C (typical std dev)
+    "relative_humidity_pct": 50.0,  # % (half of 0-100 range)
+    "pressure_hpa": 10.0,           # hPa (typical daily variation)
+    "precip_mm": 2.0,               # mm (threshold for significant rain)
+}
 
 
 # ============================================================
@@ -496,14 +506,21 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def add_features_and_target(df: pd.DataFrame) -> pd.DataFrame:
+def add_features_and_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
     """
-    Bygger features og target.
-    Target = temperaturen ved næste 6-timers måling.
+    Bygger features og 16 targets for multi-output regression.
+    Targets = alle 4 variabler ved 4 tidsskridt (6h, 12h, 24h, 48h ahead).
+    
+    Returns:
+        Tuple of (dataframe_with_features_and_16_targets, list_of_16_target_column_names)
     """
+    print("\n⏳ Creating features and 16 targets...")
     out = df.copy()
+    original_rows = len(out)
     ts = out["timestamp_local"]
 
+    # Temporal features
+    print("  • Adding temporal features (month, weekday, dayofyear, hour_sin, hour_cos, doy_sin, doy_cos)...")
     out["month"] = ts.dt.month
     out["weekday"] = ts.dt.weekday
     out["dayofyear"] = ts.dt.dayofyear
@@ -513,22 +530,45 @@ def add_features_and_target(df: pd.DataFrame) -> pd.DataFrame:
     out["doy_sin"] = np.sin(2 * np.pi * out["dayofyear"] / 366.0)
     out["doy_cos"] = np.cos(2 * np.pi * out["dayofyear"] / 366.0)
 
+    # Lagged features for all 4 variables
+    print("  • Adding lagged features (lag1, lag2, lag4 for all 4 variables)...")
     base_cols = list(PARAMETERS.values())
-
     for col in base_cols:
         out[f"{col}_lag1"] = out[col].shift(1)
         out[f"{col}_lag2"] = out[col].shift(2)
         out[f"{col}_lag4"] = out[col].shift(4)
 
+    # Rolling aggregation features
+    print("  • Adding rolling aggregation features (temp_roll4_mean, rh_roll4_mean, etc.)...")
     out["temp_roll4_mean"] = out["temperature_c"].shift(1).rolling(4).mean()
     out["rh_roll4_mean"] = out["relative_humidity_pct"].shift(1).rolling(4).mean()
     out["pressure_roll4_mean"] = out["pressure_hpa"].shift(1).rolling(4).mean()
     out["precip_roll4_sum"] = out["precip_mm"].shift(1).rolling(4).sum()
 
-    out["target_next_temperature_c"] = out["temperature_c"].shift(-1)
+    # Create 16 target columns: 4 variables × 4 time steps
+    print("  • Creating 16 targets (4 variables × 4 horizons: h1, h2, h4, h8)...")
+    variable_names = list(PARAMETERS.values())
+    time_steps = [1, 2, 4, 8]  # 6h, 12h, 24h, 48h ahead
+    
+    target_cols = []
+    for var in variable_names:
+        for step in time_steps:
+            target_col = f"target_{var}_h{step}"
+            out[target_col] = out[var].shift(-step)
+            target_cols.append(target_col)
 
-    out = out.dropna(subset=["target_next_temperature_c"]).reset_index(drop=True)
-    return out
+    # Drop rows where ANY target is NaN
+    print(f"  • Dropping rows with missing targets...")
+    out = out.dropna(subset=target_cols).reset_index(drop=True)
+    rows_after = len(out)
+    rows_lost = original_rows - rows_after
+    pct_lost = (rows_lost / original_rows * 100) if original_rows > 0 else 0
+    
+    print(f"  ✓ Features created: {len([c for c in out.columns if not c.startswith('target')] + ['timestamp_local'])} features")
+    print(f"  ✓ Targets created: {len(target_cols)} targets")
+    print(f"  ✓ Sample counts: {original_rows} → {rows_after} rows (lost {rows_lost} rows: {pct_lost:.1f}%)")
+    
+    return out, target_cols
 
 
 # ============================================================
@@ -570,6 +610,20 @@ def get_feature_columns() -> List[str]:
     ]
 
 
+def get_target_columns() -> List[str]:
+    """
+    Returnerer alle 16 target-kolonnerne (4 variabler × 4 tidsskridt).
+    """
+    variable_names = list(PARAMETERS.values())
+    time_steps = [1, 2, 4, 8]
+    
+    target_cols = []
+    for var in variable_names:
+        for step in time_steps:
+            target_cols.append(f"target_{var}_h{step}")
+    return target_cols
+
+
 def build_committee(random_state: int = 42) -> List[Pipeline]:
     """
     Bygger en lille committee af forskellige regressionsmodeller.
@@ -604,10 +658,11 @@ def build_committee(random_state: int = 42) -> List[Pipeline]:
 def fit_committee(
     committee: List[Pipeline],
     X_labeled: pd.DataFrame,
-    y_labeled: pd.Series,
+    y_labeled: pd.DataFrame | pd.Series,
 ) -> List[Pipeline]:
     """
     Træner friske kopier af alle modellerne i committee.
+    Håndterer både single-output (Series) og multi-output (DataFrame).
     """
     fitted = []
     for model in committee:
@@ -622,16 +677,29 @@ def disagreement_std(
     X_pool: pd.DataFrame,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Returnerer:
-    - predictions_matrix: shape = (n_models, n_pool_samples)
-    - disagreement: std mellem model-predictions pr. punkt
+    For multi-output regression:
+    - Input: X_pool is (n_samples, n_features)
+    - Output predictions_matrix shape = (n_models, n_samples, n_outputs=16) for multi-output
+    - disagreement shape = (n_samples,) — mean disagreement across all outputs per sample
     """
     preds = []
     for model in committee:
-        preds.append(model.predict(X_pool))
+        pred = model.predict(X_pool)
+        preds.append(pred)
 
-    predictions_matrix = np.vstack(preds)
-    disagreement = predictions_matrix.std(axis=0)
+    # preds[i] shape: (n_samples,) for single-output or (n_samples, n_outputs) for multi-output
+    predictions_matrix = np.array(preds)
+    
+    # For multi-output case: predictions_matrix shape is (n_models, n_samples, n_outputs)
+    # For single-output case: predictions_matrix shape is (n_models, n_samples)
+    if predictions_matrix.ndim == 3:
+        # Multi-output: compute std across models per output, then average across outputs
+        disagreement_per_output = predictions_matrix.std(axis=0)  # shape: (n_samples, n_outputs)
+        disagreement = disagreement_per_output.mean(axis=1)       # shape: (n_samples,)
+    else:
+        # Single-output: compute std across models directly
+        disagreement = predictions_matrix.std(axis=0)             # shape: (n_samples,)
+    
     return predictions_matrix, disagreement
 
 
@@ -640,10 +708,19 @@ def committee_mean_prediction(
     X: pd.DataFrame,
 ) -> np.ndarray:
     """
-    Endelig committee-prediction = gennemsnit af model-predictions.
+    Committee-prediction = gennemsnit af model-predictions.
+    Håndterer både single-output (1D) og multi-output (2D) predictions.
     """
-    preds = np.vstack([model.predict(X) for model in committee])
-    return preds.mean(axis=0)
+    preds = [model.predict(X) for model in committee]
+    # preds[i] is either 1D (n_samples,) or 2D (n_samples, n_outputs)
+    preds_array = np.array(preds)
+    
+    if preds_array.ndim == 3:
+        # Multi-output: preds_array shape is (n_models, n_samples, n_outputs)
+        return preds_array.mean(axis=0)  # shape: (n_samples, n_outputs)
+    else:
+        # Single-output: preds_array shape is (n_models, n_samples) after vstack-like behavior
+        return preds_array.mean(axis=0)  # shape: (n_samples,)
 
 
 def train_qbc_model(
@@ -654,24 +731,40 @@ def train_qbc_model(
     random_state: int = 42,
 ) -> QBCResult:
     """
-    Træner temperaturmodellen med Query by Committee.
+    Træner multi-output QBC model med 16 targets.
+    
+    Args:
+        df_feat: DataFrame with features and 16 target columns
+        initial_labeled_size: Initial labeled set size
+        query_batch_size: Number of samples to query per iteration
+        n_queries: Number of active learning iterations
+        random_state: Random seed for reproducibility
+        
+    Returns:
+        QBCResult with multi-output predictions and metrics
     """
+    print("\n⏳ Setting up QBC training...")
     feature_cols = get_feature_columns()
-    target_col = "target_next_temperature_c"
+    target_cols = get_target_columns()
+    
+    print(f"  • Features: {len(feature_cols)} features")
+    print(f"  • Targets: {len(target_cols)} targets (4 variables × 4 horizons)")
 
+    # Train/test split (80/20)
     split_idx = int(len(df_feat) * 0.8)
     train_df = df_feat.iloc[:split_idx].copy()
     test_df = df_feat.iloc[split_idx:].copy()
 
     X_train_full = train_df[feature_cols].reset_index(drop=True)
-    y_train_full = train_df[target_col].reset_index(drop=True)
+    y_train_full = train_df[target_cols].reset_index(drop=True)  # DataFrame with 16 columns
 
     X_test = test_df[feature_cols].reset_index(drop=True)
-    y_test = test_df[target_col].reset_index(drop=True)
+    y_test = test_df[target_cols].reset_index(drop=True)  # DataFrame with 16 columns
 
     if initial_labeled_size >= len(X_train_full):
         raise ValueError("initial_labeled_size er for stor i forhold til train-datasættet.")
 
+    # Initial split: labeled and pool
     X_labeled = X_train_full.iloc[:initial_labeled_size].copy()
     y_labeled = y_train_full.iloc[:initial_labeled_size].copy()
 
@@ -681,21 +774,33 @@ def train_qbc_model(
     ts_pool = train_df.iloc[initial_labeled_size:]["timestamp_local"].reset_index(drop=True)
     ts_test = test_df["timestamp_local"].reset_index(drop=True)
 
+    print(f"\n⏳ Train/test split:")
+    print(f"  • Train (labeled + pool): {len(X_train_full)} rows")
+    print(f"  • Test: {len(X_test)} rows")
+    print(f"  • Labeled (initial): {len(X_labeled)} rows")
+    print(f"  • Pool: {len(X_pool)} rows")
+
     base_committee = build_committee(random_state=random_state)
 
     learning_curve_rows = []
     last_pool_predictions_df = pd.DataFrame()
     last_selected_points_df = pd.DataFrame()
 
-    for step in range(n_queries):
+    print(f"\n⏳ Starting QBC active learning loop ({n_queries} iterations)...")
+    
+    for step in tqdm(range(n_queries), desc="QBC Iterations", unit="it"):
         if len(X_pool) == 0:
+            tqdm.write(f"  ℹ Pool exhausted at iteration {step}")
             break
 
+        # Train committee
         fitted_committee = fit_committee(base_committee, X_labeled, y_labeled)
 
+        # Evaluate on test set - aggregate MAE/RMSE across all 16 targets
         test_pred = committee_mean_prediction(fitted_committee, X_test)
-        mae = mean_absolute_error(y_test, test_pred)
-        rmse = float(np.sqrt(mean_squared_error(y_test, test_pred)))
+        # For multi-output: y_test and test_pred are both (n_samples, 16)
+        mae = mean_absolute_error(y_test.values.flatten(), test_pred.flatten())
+        rmse = float(np.sqrt(mean_squared_error(y_test.values.flatten(), test_pred.flatten())))
 
         learning_curve_rows.append({
             "iteration": step,
@@ -705,22 +810,55 @@ def train_qbc_model(
             "test_rmse": rmse,
         })
 
+        # Compute disagreement on pool
         pred_matrix, disagreement = disagreement_std(fitted_committee, X_pool)
-        committee_mean = pred_matrix.mean(axis=0)
+        
+        # Compute committee mean for pool
+        if pred_matrix.ndim == 3:
+            # Multi-output: shape (n_models, n_samples, n_outputs)
+            committee_mean = pred_matrix.mean(axis=0)  # shape: (n_samples, n_outputs)
+        else:
+            # Single-output: shape (n_models, n_samples)
+            committee_mean = pred_matrix.mean(axis=0)  # shape: (n_samples,)
 
+        # Select query samples (top disagreement)
         n_select = min(query_batch_size, len(X_pool))
         query_indices = np.argsort(disagreement)[-n_select:]
         query_indices = np.sort(query_indices)
 
+        # Disagreement stats for logging
+        disagreement_mean = disagreement.mean()
+        disagreement_std_val = disagreement.std()
+        disagreement_max = disagreement.max()
+
+        tqdm.write(f"    Iter {step}: Train={len(X_labeled)}, Pool={len(X_pool)}, "
+                  f"TestMAE={mae:.4f}, Disagreement=(mean={disagreement_mean:.4f}, max={disagreement_max:.4f}), "
+                  f"Selected={n_select}")
+
+        # Compute committee mean across all models
+        if pred_matrix.ndim == 3:
+            # Multi-output: mean across models and outputs
+            committee_mean_all = pred_matrix.mean(axis=0).mean(axis=1)  # shape: (n_samples,)
+        else:
+            # Single-output: mean across models
+            committee_mean_all = pred_matrix.mean(axis=0)  # shape: (n_samples,)
+
+        # Store pool predictions
         pool_pred_dict = {
             "timestamp_local": ts_pool.values,
-            "committee_mean": committee_mean,
+            "committee_mean": committee_mean_all,
             "disagreement_std": disagreement,
             "selected_by_qbc": False,
         }
 
-        for model_idx in range(pred_matrix.shape[0]):
-            pool_pred_dict[f"model_{model_idx+1}_pred"] = pred_matrix[model_idx]
+        # Store predictions per model
+        for model_idx in range(len(fitted_committee)):
+            if pred_matrix.ndim == 3:
+                # Multi-output
+                pool_pred_dict[f"model_{model_idx+1}_pred_mean"] = pred_matrix[model_idx].mean(axis=1)
+            else:
+                # Single-output
+                pool_pred_dict[f"model_{model_idx+1}_pred"] = pred_matrix[model_idx]
 
         iteration_pool_predictions_df = pd.DataFrame(pool_pred_dict)
         iteration_pool_predictions_df.loc[query_indices, "selected_by_qbc"] = True
@@ -735,12 +873,14 @@ def train_qbc_model(
             .reset_index(drop=True)
         )
 
+        # Move selected samples from pool to labeled
         X_new = X_pool.iloc[query_indices].copy()
         y_new = y_pool.iloc[query_indices].copy()
 
         X_labeled = pd.concat([X_labeled, X_new], ignore_index=True)
         y_labeled = pd.concat([y_labeled, y_new], ignore_index=True)
 
+        # Update pool
         keep_mask = np.ones(len(X_pool), dtype=bool)
         keep_mask[query_indices] = False
 
@@ -748,12 +888,19 @@ def train_qbc_model(
         y_pool = y_pool.iloc[keep_mask].reset_index(drop=True)
         ts_pool = ts_pool.iloc[keep_mask].reset_index(drop=True)
 
+    # Final training on all labeled data
+    print(f"\n⏳ Training final committee on {len(X_labeled)} labeled samples...")
     final_committee = fit_committee(base_committee, X_labeled, y_labeled)
+    print(f"  ✓ Final committee trained")
 
+    # Final evaluation
+    print(f"\n⏳ Computing final predictions on {len(X_test)} test samples...")
     final_pred = committee_mean_prediction(final_committee, X_test)
-    final_mae = mean_absolute_error(y_test, final_pred)
-    final_rmse = float(np.sqrt(mean_squared_error(y_test, final_pred)))
+    final_mae = mean_absolute_error(y_test.values.flatten(), final_pred.flatten())
+    final_rmse = float(np.sqrt(mean_squared_error(y_test.values.flatten(), final_pred.flatten())))
+    print(f"  ✓ Final MAE: {final_mae:.4f}, final RMSE: {final_rmse:.4f}")
 
+    # Remaining pool disagreement (for visualization)
     if len(X_pool) > 0:
         _, final_disagreement = disagreement_std(final_committee, X_pool)
         final_committee_disagreement = pd.DataFrame({
@@ -765,11 +912,15 @@ def train_qbc_model(
             columns=["timestamp_local", "disagreement_std"]
         )
 
-    predictions = pd.DataFrame({
-        "timestamp_local": ts_test,
-        "actual_next_temp_c": y_test.values,
-        "predicted_next_temp_c": final_pred,
-    })
+    # Build predictions DataFrame with all 16 targets
+    print(f"⏳ Building predictions DataFrame with {len(target_cols)} targets...")
+    pred_dict = {"timestamp_local": ts_test.values}
+    for target_col in target_cols:
+        pred_dict[f"actual_{target_col}"] = y_test[target_col].values
+        pred_dict[f"pred_{target_col}"] = final_pred[:, target_cols.index(target_col)]
+    
+    predictions = pd.DataFrame(pred_dict)
+    print(f"  ✓ Predictions DataFrame created: {predictions.shape}")
 
     metrics = {
         "train_rows_final": len(X_labeled),
@@ -777,6 +928,8 @@ def train_qbc_model(
         "mae": float(final_mae),
         "rmse": float(final_rmse),
         "n_queries_completed": len(learning_curve_rows),
+        "n_features": len(feature_cols),
+        "n_targets": len(target_cols),
     }
 
     learning_curve = pd.DataFrame(learning_curve_rows)
@@ -794,11 +947,195 @@ def train_qbc_model(
 
 
 # ============================================================
+# Metric Computation Functions
+# ============================================================
+def compute_metrics_per_variable_horizon(
+    y_test: pd.DataFrame,
+    y_pred: pd.DataFrame,
+    target_cols: List[str],
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Compute MAE and RMSE for each target variable and horizon.
+    
+    Args:
+        y_test: DataFrame with actual values (columns are "actual_target_*")
+        y_pred: DataFrame with predictions (columns are "pred_target_*")
+        target_cols: List of target column names (e.g., "target_temperature_c_h1")
+    
+    Returns:
+        Nested dict: {variable: {horizon: {'mae': float, 'rmse': float}}}
+    """
+    metrics_dict = {}
+    
+    print(f"\n⏳ Computing MAE/RMSE for {len(target_cols)} targets...")
+    for target_col in tqdm(target_cols, desc="Metrics", unit="target"):
+        # Extract variable and horizon from column name
+        # Format: target_{variable}_h{step}
+        parts = target_col.split("_h")
+        horizon_step = int(parts[-1])
+        
+        # Map step to human-readable horizon
+        horizon_map = {1: "6h", 2: "12h", 4: "24h", 8: "48h"}
+        horizon = horizon_map.get(horizon_step, f"{horizon_step}h")
+        
+        # Extract variable (everything after "target_" and before "_h")
+        temp = target_col.replace("target_", "").rsplit("_h", 1)[0]
+        var_name = temp
+        
+        # Get actual and predicted values from y_pred DataFrame
+        actual_col = f"actual_{target_col}"
+        pred_col = f"pred_{target_col}"
+        
+        if actual_col not in y_pred.columns:
+            continue
+        if pred_col not in y_pred.columns:
+            continue
+            
+        actual = y_pred[actual_col].values
+        pred = y_pred[pred_col].values
+        
+        mae = mean_absolute_error(actual, pred)
+        rmse = float(np.sqrt(mean_squared_error(actual, pred)))
+        
+        if var_name not in metrics_dict:
+            metrics_dict[var_name] = {}
+        metrics_dict[var_name][horizon] = {"mae": mae, "rmse": rmse}
+    
+    print(f"  ✓ Metrics computed for all targets")
+    return metrics_dict
+
+
+def compute_standardized_metrics(
+    y_test: pd.DataFrame,
+    y_pred: pd.DataFrame,
+    target_cols: List[str],
+    std_factors: Dict[str, float],
+) -> Dict[str, any]:
+    """
+    Compute normalized MAE for each target using standardization factors.
+    
+    Args:
+        y_test: DataFrame with actual values (columns are "actual_target_*")
+        y_pred: DataFrame with predictions (columns are "pred_target_*")
+        target_cols: List of target column names
+        std_factors: Dict mapping variable names to standardization factors
+    
+    Returns:
+        Dict with keys:
+        - 'common_error': overall normalized MAE
+        - 'by_variable': {var: normalized_mae}
+        - 'by_horizon': {horizon: normalized_mae}
+    """
+    print(f"\n⏳ Computing standardized metrics with {len(std_factors)} standardization factors...")
+    
+    all_normalized_maes = []
+    by_variable = {}
+    by_horizon = {}
+    
+    horizon_map = {1: "6h", 2: "12h", 4: "24h", 8: "48h"}
+    
+    for target_col in tqdm(target_cols, desc="Standardized metrics", unit="target"):
+        # Parse target name: target_{variable}_h{step}
+        parts = target_col.split("_h")
+        horizon_step = int(parts[-1])
+        horizon = horizon_map.get(horizon_step, f"{horizon_step}h")
+        
+        # Extract variable name
+        var_name = target_col.replace("target_", "").rsplit("_h", 1)[0]
+        
+        # Get actual and predicted values from y_pred DataFrame
+        actual_col = f"actual_{target_col}"
+        pred_col = f"pred_{target_col}"
+        
+        if actual_col not in y_pred.columns or pred_col not in y_pred.columns:
+            continue
+            
+        actual = y_pred[actual_col].values
+        pred = y_pred[pred_col].values
+        
+        mae = mean_absolute_error(actual, pred)
+        std_factor = std_factors.get(var_name, 1.0)
+        normalized_mae = mae / std_factor
+        
+        all_normalized_maes.append(normalized_mae)
+        
+        # Track by variable
+        if var_name not in by_variable:
+            by_variable[var_name] = []
+        by_variable[var_name].append(normalized_mae)
+        
+        # Track by horizon
+        if horizon not in by_horizon:
+            by_horizon[horizon] = []
+        by_horizon[horizon].append(normalized_mae)
+    
+    # Average within each group
+    by_variable_avg = {var: np.mean(vals) for var, vals in by_variable.items()}
+    by_horizon_avg = {horizon: np.mean(vals) for horizon, vals in by_horizon.items()}
+    
+    print(f"  ✓ Standardized metrics computed")
+    
+    return {
+        "common_error": np.mean(all_normalized_maes),
+        "by_variable": by_variable_avg,
+        "by_horizon": by_horizon_avg,
+        "all_normalized_maes": all_normalized_maes,
+    }
+
+
+def format_metrics_table(metrics_dict: Dict[str, Dict[str, Dict[str, float]]]) -> str:
+    """Format per-variable metrics into readable tables."""
+    output = "\n" + "=" * 80 + "\n"
+    output += "METRICS PER VARIABLE AND HORIZON (MAE / RMSE)\n"
+    output += "=" * 80 + "\n\n"
+    
+    horizon_order = ["6h", "12h", "24h", "48h"]
+    
+    for var_name in sorted(metrics_dict.keys()):
+        output += f"{var_name.upper()}:\n"
+        horiz_metrics = metrics_dict[var_name]
+        
+        for horizon in horizon_order:
+            if horizon in horiz_metrics:
+                mae = horiz_metrics[horizon]["mae"]
+                rmse = horiz_metrics[horizon]["rmse"]
+                output += f"  {horizon:>6} ahead:  MAE={mae:.4f}, RMSE={rmse:.4f}\n"
+        
+        output += "\n"
+    
+    return output
+
+
+def format_standardized_metrics(std_metrics: Dict[str, any], std_factors: Dict[str, float]) -> str:
+    """Format standardized metrics into readable output."""
+    output = "\n" + "=" * 80 + "\n"
+    output += "STANDARDIZED COMMON ERROR METRIC\n"
+    output += "=" * 80 + "\n\n"
+    
+    output += f"Normalized MAE (across all 16 targets): {std_metrics['common_error']:.4f}\n\n"
+    
+    output += "Breakdown by variable:\n"
+    for var_name in sorted(std_metrics["by_variable"].keys()):
+        norm_mae = std_metrics["by_variable"][var_name]
+        std_factor = std_factors.get(var_name, "N/A")
+        output += f"  {var_name.ljust(25)} (std factor={str(std_factor):>6}):  Normalized MAE = {norm_mae:.4f}\n"
+    
+    output += "\nBreakdown by horizon:\n"
+    horizon_order = ["6h", "12h", "24h", "48h"]
+    for horizon in horizon_order:
+        if horizon in std_metrics["by_horizon"]:
+            norm_mae = std_metrics["by_horizon"][horizon]
+            output += f"  {horizon:>4}:  Normalized MAE = {norm_mae:.4f}\n"
+    
+    return output
+
+
+# ============================================================
 # Visualisering
 # ============================================================
 def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
     """
-    Visualiserer den seneste QBC-iteration.
+    Visualiserer den seneste QBC-iteration med committee mean.
     """
     df = result.final_pool_predictions.copy()
 
@@ -810,31 +1147,33 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
         df = df.tail(max_points).reset_index(drop=True)
 
     selected_df = df[df["selected_by_qbc"]].copy()
-    model_cols = [c for c in df.columns if c.startswith("model_") and c.endswith("_pred")]
+    # Match both "model_X_pred" and "model_X_pred_mean" column names
+    model_cols = [c for c in df.columns if c.startswith("model_") and ("_pred" in c)]
 
     fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
 
     for col in model_cols:
         axes[0].plot(df["timestamp_local"], df[col], alpha=0.7, label=col)
 
-    axes[0].plot(
-        df["timestamp_local"],
-        df["committee_mean"],
-        linewidth=2,
-        label="committee_mean",
-    )
-
-    if not selected_df.empty:
-        axes[0].scatter(
-            selected_df["timestamp_local"],
-            selected_df["committee_mean"],
-            s=70,
-            marker="o",
-            label="QBC selected",
+    if "committee_mean" in df.columns:
+        axes[0].plot(
+            df["timestamp_local"],
+            df["committee_mean"],
+            linewidth=2,
+            label="committee_mean",
         )
 
+        if not selected_df.empty:
+            axes[0].scatter(
+                selected_df["timestamp_local"],
+                selected_df["committee_mean"],
+                s=70,
+                marker="o",
+                label="QBC selected",
+            )
+
     axes[0].set_title("Committee predictioner på unlabeled pool")
-    axes[0].set_ylabel("Forudsagt næste temperatur (°C)")
+    axes[0].set_ylabel("Forudsagt værdi (aggregeret over 16 targets)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
@@ -890,25 +1229,158 @@ def plot_qbc_learning_curve(result: QBCResult) -> None:
     plt.savefig("plots/qbc_learning_curve.png")
 
 
+def plot_predictions_per_variable_horizon(pred_df: pd.DataFrame, target_cols: List[str]) -> None:
+    """
+    Create comprehensive plots for all 4 variables × 4 horizons.
+    Each subplot shows actual vs predicted values over time.
+    """
+    print("\n⏳ Creating detailed prediction plots for all variables and horizons...")
+    
+    variables = ["temperature_c", "relative_humidity_pct", "pressure_hpa", "precip_mm"]
+    var_titles = {"temperature_c": "Temperature (°C)", 
+                  "relative_humidity_pct": "Relative Humidity (%)",
+                  "pressure_hpa": "Pressure (hPa)",
+                  "precip_mm": "Precipitation (mm)"}
+    
+    for var in variables:
+        # Create a 2x2 subplot grid for each variable (one per horizon)
+        fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+        fig.suptitle(f"Predictions vs Actual: {var_titles.get(var, var.upper())}", 
+                     fontsize=16, fontweight='bold', y=0.995)
+        axes = axes.flatten()
+        
+        for horizon_idx, (step, horizon) in enumerate([(1, "6h"), (2, "12h"), (4, "24h"), (8, "48h")]):
+            target_col = f"target_{var}_h{step}"
+            actual_col = f"actual_{target_col}"
+            pred_col = f"pred_{target_col}"
+            
+            if actual_col not in pred_df.columns or pred_col not in pred_df.columns:
+                axes[horizon_idx].text(0.5, 0.5, f"No data for {horizon}", ha='center', va='center')
+                axes[horizon_idx].set_title(f"{horizon} ahead")
+                continue
+            
+            actual = pred_df[actual_col].values
+            predictions = pred_df[pred_col].values
+            x_axis = range(len(actual))
+            
+            # Plot actual vs predicted
+            axes[horizon_idx].plot(x_axis, actual, 'o-', label='Actual', linewidth=2.5, markersize=5, alpha=0.8, color='#2E86AB')
+            axes[horizon_idx].plot(x_axis, predictions, 's--', label='Predicted', linewidth=2.5, markersize=5, alpha=0.8, color='#A23B72')
+            
+            # Compute MAE and RMSE for this specific target
+            mae = mean_absolute_error(actual, predictions)
+            rmse = float(np.sqrt(mean_squared_error(actual, predictions)))
+            
+            axes[horizon_idx].set_title(f"{horizon} ahead\nMAE={mae:.4f}, RMSE={rmse:.4f}", fontsize=11, fontweight='bold')
+            axes[horizon_idx].set_xlabel("Test Sample Index", fontsize=10)
+            axes[horizon_idx].set_ylabel(var_titles.get(var, var), fontsize=10)
+            axes[horizon_idx].legend(loc='best', fontsize=10)
+            axes[horizon_idx].grid(True, alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        os.makedirs("plots", exist_ok=True)
+        plot_filename = f"plots/predictions_{var}.png"
+        plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  ✓ Saved {plot_filename}")
+
+
+def plot_error_degradation(pred_df: pd.DataFrame, target_cols: List[str]) -> None:
+    """
+    Plot how prediction error increases with forecast horizon for each variable.
+    Shows error degradation across 6h, 12h, 24h, 48h horizons.
+    """
+    print("⏳ Creating error degradation plots...")
+    
+    variables = ["temperature_c", "relative_humidity_pct", "pressure_hpa", "precip_mm"]
+    var_titles = {"temperature_c": "Temperature", 
+                  "relative_humidity_pct": "Relative Humidity",
+                  "pressure_hpa": "Pressure",
+                  "precip_mm": "Precipitation"}
+    units = {"temperature_c": "°C", "relative_humidity_pct": "%", "pressure_hpa": "hPa", "precip_mm": "mm"}
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Prediction Error Degradation by Forecast Horizon", fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A']
+    
+    for var_idx, var in enumerate(variables):
+        horizons_data = {"6h": [], "12h": [], "24h": [], "48h": []}
+        horizon_steps = {1: "6h", 2: "12h", 4: "24h", 8: "48h"}
+        
+        for step, horizon in horizon_steps.items():
+            target_col = f"target_{var}_h{step}"
+            actual_col = f"actual_{target_col}"
+            pred_col = f"pred_{target_col}"
+            
+            if actual_col in pred_df.columns and pred_col in pred_df.columns:
+                actual = pred_df[actual_col].values
+                predictions = pred_df[pred_col].values
+                mae = mean_absolute_error(actual, predictions)
+                horizons_data[horizon].append(mae)
+        
+        # Plot MAE degradation
+        horizons_list = ["6h", "12h", "24h", "48h"]
+        maes = [horizons_data[h][0] if horizons_data[h] else 0 for h in horizons_list]
+        
+        x_pos = range(len(horizons_list))
+        axes[var_idx].plot(x_pos, maes, 'o-', linewidth=3, markersize=10, 
+                          color=colors[var_idx], markerfacecolor='white', markeredgewidth=2.5)
+        axes[var_idx].fill_between(x_pos, maes, alpha=0.2, color=colors[var_idx])
+        
+        axes[var_idx].set_title(f"{var_titles.get(var, var.upper())}", fontsize=12, fontweight='bold')
+        axes[var_idx].set_xlabel("Forecast Horizon", fontsize=11)
+        axes[var_idx].set_ylabel(f"MAE ({units.get(var, 'unit')})", fontsize=11)
+        axes[var_idx].set_xticks(x_pos)
+        axes[var_idx].set_xticklabels(horizons_list)
+        axes[var_idx].grid(True, alpha=0.3, linestyle='--')
+        
+        # Add value labels on points
+        for i, (h, mae) in enumerate(zip(horizons_list, maes)):
+            if mae > 0:
+                axes[var_idx].text(i, mae + max(maes)*0.08, f"{mae:.3f}", 
+                                  ha='center', fontsize=10, fontweight='bold')
+    
+    plt.tight_layout()
+    os.makedirs("plots", exist_ok=True)
+    plot_filename = "plots/error_degradation.png"
+    plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"  ✓ Saved {plot_filename}")
+
+
 # ============================================================
 # Main
 # ============================================================
 def main() -> None:
-    print("Finder bedste station i København-området baseret på dennes dækning (coverage_score)...")
+    print("=" * 80)
+    print("DMI Copenhagen Multi-Variable, Multi-Horizon Weather Prediction with QBC")
+    print("=" * 80)
+    
+    print("\n⏳ Finder bedste station i København-området baseret på dennes dækning...")
     best_score, raw_best_dataset, station_ranking = find_best_station()
 
-    print("\nBedste station valgt:")
-    print(f"  stationId      : {best_score.station_id}")
-    print(f"  navn           : {best_score.station_name}")
-    print(f"  afstand (km)   : {best_score.distance_km:.2f}")
-    print(f"  coverage_score : {best_score.coverage_score:.4f}")
-    print(f"  completeness   : {best_score.completeness_ratio:.2%}")
-    print(f"  komplette rækker (4 variabler): {best_score.rows_complete_all_vars}/{best_score.rows_expected}")
-    print(f"  rå rækker pr. variabel: {best_score.rows_by_variable}")
+    print("\n✓ Bedste station valgt:")
+    print(f"  • stationId      : {best_score.station_id}")
+    print(f"  • navn           : {best_score.station_name}")
+    print(f"  • afstand (km)   : {best_score.distance_km:.2f}")
+    print(f"  • coverage_score : {best_score.coverage_score:.4f}")
+    print(f"  • completeness   : {best_score.completeness_ratio:.2%}")
+    print(f"  • komplette rækker (4 variabler): {best_score.rows_complete_all_vars}/{best_score.rows_expected}")
+    print(f"  • rå rækker pr. variabel: {best_score.rows_by_variable}")
 
+    print(f"\n⏳ Cleaning dataset ({len(raw_best_dataset)} rows)...")
     clean_df = clean_dataset(raw_best_dataset)
-    feat_df = add_features_and_target(clean_df)
+    print(f"  ✓ Dataset cleaned: {len(clean_df)} rows retained")
 
+    print(f"\n⏳ Adding features and 16 targets ({len(clean_df)} samples)...")
+    feat_df, target_cols = add_features_and_target(clean_df)
+    print(f"  ✓ Features and targets added: {feat_df.shape[0]} samples × {feat_df.shape[1]} columns")
+    print(f"     → {len([c for c in feat_df.columns if not c.startswith('target')])} features")
+    print(f"     → {len(target_cols)} targets (4 variables × 4 horizons)")
+
+    print(f"\n⏳ Training QBC model with multi-output regression...")
     qbc_result = train_qbc_model(
         feat_df,
         initial_labeled_size=80,
@@ -917,57 +1389,149 @@ def main() -> None:
         random_state=42,
     )
 
+    print(f"\n⏳ Plotting QBC results...")
     plot_qbc_learning_curve(qbc_result)
     plot_qbc_selection(qbc_result, max_points=120)
-
+    print(f"  ✓ QBC plots saved to plots/")
+    
+    # Extract results from QBC
     metrics = qbc_result.metrics
     pred_df = qbc_result.predictions
     learning_curve_df = qbc_result.learning_curve
     disagreement_df = qbc_result.final_committee_disagreement
+    
+    # Extract target columns for metric computation
+    target_cols = get_target_columns()
+    
+    # Create detailed prediction plots for all variables and horizons
+    plot_predictions_per_variable_horizon(pred_df, target_cols)
+    plot_error_degradation(pred_df, target_cols)
 
-    print("\nQBC-modelresultater:")
-    print(f"  final train rows : {metrics['train_rows_final']}")
-    print(f"  test rows        : {metrics['test_rows']}")
-    print(f"  MAE              : {metrics['mae']:.3f} °C")
-    print(f"  RMSE             : {metrics['rmse']:.3f} °C")
-    print(f"  query iterations : {metrics['n_queries_completed']}")
+    # Print QBC summary
+    print("\n" + "=" * 80)
+    print("QBC MODEL RESULTS")
+    print("=" * 80)
+    print(f"\nDataset Summary:")
+    print(f"  • Final labeled rows (train)   : {metrics['train_rows_final']}")
+    print(f"  • Test rows                    : {metrics['test_rows']}")
+    print(f"  • Input features               : {metrics['n_features']}")
+    print(f"  • Prediction targets           : {metrics['n_targets']} (4 variables × 4 horizons)")
+    print(f"  • Active learning iterations   : {metrics['n_queries_completed']}")
 
-    print("\nLearning curve (sidste 10 iterationer):")
+    print(f"\nAggregated Performance (across all 16 targets):")
+    print(f"  • MAE (Mean Absolute Error)    : {metrics['mae']:.4f}")
+    print(f"  • RMSE (Root Mean Squared Error): {metrics['rmse']:.4f}")
+
+    print(f"\nLearning Curve (last 10 iterations):")
     print(learning_curve_df.tail(10).to_string(index=False))
 
-    print("\nSeneste 10 prediction-rækker:")
+    print(f"\nRecent Test Predictions (last 10 samples):")
     print(pred_df.tail(10).to_string(index=False))
 
-    print("\nTop 10 mest usikre resterende pool-punkter:")
-    if disagreement_df.empty:
-        print("Ingen resterende pool-punkter.")
-    else:
+    if not disagreement_df.empty:
+        print(f"\nTop 10 most uncertain remaining pool points:")
         print(disagreement_df.head(10).to_string(index=False))
+    else:
+        print("\nNo remaining pool points.")
 
+    # Compute per-variable, per-horizon metrics
+    print("\n⏳ Computing metrics per variable and horizon...")
+    var_horizon_metrics = compute_metrics_per_variable_horizon(pred_df, pred_df, target_cols)
+    
+    # Print formatted metrics table
+    metrics_output = format_metrics_table(var_horizon_metrics)
+    print(metrics_output)
 
-    # Create the folder automatically if it doesn't exist
+    # Compute standardized metrics
+    print("\n⏳ Computing standardized metrics...")
+    std_metrics = compute_standardized_metrics(pred_df, pred_df, target_cols, STANDARDIZATION_FACTORS)
+    
+    # Print formatted standardized metrics
+    std_output = format_standardized_metrics(std_metrics, STANDARDIZATION_FACTORS)
+    print(std_output)
+
+    # Save results to CSV files
+    print("\n⏳ Saving results to CSV files...")
     os.makedirs("data", exist_ok=True)
 
+    print("  • Saving station ranking...")
     station_ranking.to_csv("data/dmi_station_ranking.csv", index=False)
+    
+    print("  • Saving raw dataset...")
     raw_best_dataset.to_csv("data/dmi_best_station_raw_4x_daily.csv", index=False)
+    
+    print("  • Saving cleaned dataset...")
     clean_df.to_csv("data/dmi_copenhagen_clean_4x_daily.csv", index=False)
+    
+    print("  • Saving features and targets...")
     feat_df.to_csv("data/dmi_copenhagen_features_4x_daily.csv", index=False)
-    pred_df.to_csv("data/dmi_qbc_temperature_predictions.csv", index=False)
+    
+    print("  • Saving multi-output predictions...")
+    pred_df.to_csv("data/dmi_qbc_multioutput_predictions.csv", index=False)
+    
+    print("  • Saving learning curve...")
     learning_curve_df.to_csv("data/dmi_qbc_learning_curve.csv", index=False)
+    
+    print("  • Saving pool disagreement...")
     disagreement_df.to_csv("data/dmi_qbc_pool_disagreement.csv", index=False)
+    
+    print("  • Saving final pool predictions...")
     qbc_result.final_pool_predictions.to_csv("data/dmi_qbc_final_pool_predictions.csv", index=False)
+    
+    print("  • Saving selected points...")
     qbc_result.final_selected_points.to_csv("data/dmi_qbc_selected_points.csv", index=False)
+    
+    # Save metrics tables
+    print("  • Saving per-variable, per-horizon metrics...")
+    metrics_rows = []
+    for var_name in var_horizon_metrics:
+        for horizon in var_horizon_metrics[var_name]:
+            metrics_rows.append({
+                "variable": var_name,
+                "horizon": horizon,
+                "mae": var_horizon_metrics[var_name][horizon]["mae"],
+                "rmse": var_horizon_metrics[var_name][horizon]["rmse"],
+            })
+    metrics_df = pd.DataFrame(metrics_rows)
+    metrics_df.to_csv("data/dmi_metrics_by_variable_horizon.csv", index=False)
+    
+    print("  • Saving standardized metrics...")
+    std_metrics_rows = []
+    for var_name in std_metrics["by_variable"]:
+        std_metrics_rows.append({
+            "variable": var_name,
+            "normalized_mae": std_metrics["by_variable"][var_name],
+        })
+    for horizon in std_metrics["by_horizon"]:
+        std_metrics_rows.append({
+            "horizon": horizon,
+            "normalized_mae": std_metrics["by_horizon"][horizon],
+        })
+    std_metrics_rows.append({
+        "metric": "common_error",
+        "value": std_metrics["common_error"],
+    })
+    std_metrics_df = pd.DataFrame(std_metrics_rows)
+    std_metrics_df.to_csv("data/dmi_metrics_standardized.csv", index=False)
 
-    print("\nFiler gemt:")
-    print("  - dmi_station_ranking.csv")
-    print("  - dmi_best_station_raw_4x_daily.csv")
-    print("  - dmi_copenhagen_clean_4x_daily.csv")
-    print("  - dmi_copenhagen_features_4x_daily.csv")
-    print("  - dmi_qbc_temperature_predictions.csv")
-    print("  - dmi_qbc_learning_curve.csv")
-    print("  - dmi_qbc_pool_disagreement.csv")
-    print("  - dmi_qbc_final_pool_predictions.csv")
-    print("  - dmi_qbc_selected_points.csv")
+    print("\n" + "=" * 80)
+    print("✓ ALL FILES SAVED SUCCESSFULLY")
+    print("=" * 80)
+    print("\nOutput files created:")
+    print("  • dmi_station_ranking.csv")
+    print("  • dmi_best_station_raw_4x_daily.csv")
+    print("  • dmi_copenhagen_clean_4x_daily.csv")
+    print("  • dmi_copenhagen_features_4x_daily.csv")
+    print("  • dmi_qbc_multioutput_predictions.csv")
+    print("  • dmi_qbc_learning_curve.csv")
+    print("  • dmi_qbc_pool_disagreement.csv")
+    print("  • dmi_qbc_final_pool_predictions.csv")
+    print("  • dmi_qbc_selected_points.csv")
+    print("  • dmi_metrics_by_variable_horizon.csv")
+    print("  • dmi_metrics_standardized.csv")
+    print("\nPlot files created:")
+    print("  • plots/qbc_learning_curve.png")
+    print("  • plots/qbc_selection.png")
 
 
 if __name__ == "__main__":
