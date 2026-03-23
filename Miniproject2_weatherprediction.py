@@ -860,7 +860,8 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show()
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig("plots/qbc_selection.png")
 
 
 def plot_qbc_learning_curve(result: QBCResult) -> None:
@@ -885,7 +886,8 @@ def plot_qbc_learning_curve(result: QBCResult) -> None:
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.show()
+    os.makedirs("plots", exist_ok=True)
+    plt.savefig("plots/qbc_learning_curve.png")
 
 
 # ============================================================
