@@ -891,7 +891,7 @@ def plot_qbc_learning_curve(result: QBCResult) -> None:
 # Main
 # ============================================================
 def main() -> None:
-    print("Finder bedste station i København-området ...")
+    print("Finder bedste station i København-området baseret på dennes dækning (coverage_score)...")
     best_score, raw_best_dataset, station_ranking = find_best_station()
 
     print("\nBedste station valgt:")
