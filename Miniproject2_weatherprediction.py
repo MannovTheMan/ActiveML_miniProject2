@@ -57,28 +57,44 @@ from sklearn.preprocessing import StandardScaler
 
 os.makedirs("logs", exist_ok=True)
 timestamp = datetime.now().strftime("%d-%b-%Y_%H-%M-%S")
-log_filename = f"logs/output_{timestamp}.log"
 
-# Configure logging
+main_log = f"logs/output_{timestamp}.log"
+debug_log = f"logs/debug_{timestamp}.log"
+
+# Main logger
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# File handler (writes to log file)
-file_handler = logging.FileHandler(log_filename, encoding="utf-8")
-file_handler.setLevel(logging.INFO)
+formatter = logging.Formatter("%(message)s")
 
-# Console handler (prints to terminal)
+# Main file handler
+file_handler = logging.FileHandler(main_log, encoding="utf-8")
+file_handler.setLevel(logging.INFO)
+file_handler.setFormatter(formatter)
+
+# Console handler
 console_handler = logging.StreamHandler(sys.stdout)
 console_handler.setLevel(logging.INFO)
-
-# Format for both
-formatter = logging.Formatter("%(message)s")
-file_handler.setFormatter(formatter)
 console_handler.setFormatter(formatter)
 
-# Add handlers to logger
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
+
+# ============================================================
+# Dedicated debug-only logger (EMPTY unless you use it)
+# ============================================================
+
+debug_logger = logging.getLogger("debug_only")
+debug_logger.setLevel(logging.DEBUG)
+debug_logger.propagate = False  # prevent leaking into root logger
+
+debug_handler = logging.FileHandler(debug_log, encoding="utf-8")
+debug_handler.setLevel(logging.DEBUG)
+debug_handler.setFormatter(formatter)
+
+debug_logger.addHandler(debug_handler)
+
+
 
 
 # ============================================================
@@ -484,29 +500,30 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
     - bygger en fuld 6-timers tidsakse
     - merger med eksisterende data
     - interpolerer kontinuerte variable på DatetimeIndex
-    - fylder nedbør med 0 som simpel baseline
+    - fylder nedbør med 0 i stedet for NaN-værdier
     """
     if df.empty:
         raise RuntimeError("Tomt datasæt efter merge.")
 
     out = df.copy()
+    debug_logger.debug(out.to_string() + "\n\n\n\n =========================================================================================================== \n\n\n\n")
     out["timestamp_local"] = pd.to_datetime(out["timestamp_local"], errors="coerce")
     out = out.dropna(subset=["timestamp_local"]).sort_values("timestamp_local")
 
-    start = out["timestamp_local"].min().floor("D")
-    end = out["timestamp_local"].max().ceil("D")
+    start = out["timestamp_local"].min().floor("D").tz_convert("UTC")
+    end = out["timestamp_local"].max().ceil("D").tz_convert("UTC")
 
-    full_index = pd.date_range(
-        start=start,
-        end=end,
-        freq="6h",
-        tz=COPENHAGEN_TZ,
+    
+    full_index = (
+        pd.date_range(start=start, end=end, freq="6h", tz="UTC")
+        .tz_convert("Europe/Copenhagen")
     )
+
 
     full = pd.DataFrame({"timestamp_local": full_index})
     full["date_local"] = full["timestamp_local"].dt.date
     full["hour_local"] = full["timestamp_local"].dt.hour
-    full = full[full["hour_local"].isin(sorted(TARGET_HOURS))]
+    # full = full[full["hour_local"].isin(sorted(TARGET_HOURS))]
 
     out = full.merge(
         out,
@@ -536,6 +553,7 @@ def clean_dataset(df: pd.DataFrame) -> pd.DataFrame:
 
     out["date_local"] = out["timestamp_local"].dt.date
     out["hour_local"] = out["timestamp_local"].dt.hour
+    debug_logger.debug(out.to_string() + "\n\n\n\n =========================================================================================================== \n\n\n\n")
 
     return out
 
