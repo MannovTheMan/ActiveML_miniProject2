@@ -38,6 +38,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
 
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to avoid tkinter issues
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -144,6 +146,21 @@ STANDARDIZATION_FACTORS: Dict[str, float] = {
     "pressure_hpa": 10.0,           # hPa (typical daily variation)
     "precip_mm": 2.0,               # mm (threshold for significant rain)
 }
+
+# QBC and Model Configuration
+# ============================================================
+# Active Learning Parameters
+QBC_INITIAL_LABELED_SIZE = 80           # Number of samples to start with
+QBC_QUERY_BATCH_SIZE = 1                # Number of samples to query per iteration
+QBC_N_QUERIES = 25                      # Number of active learning iterations
+QBC_RANDOM_STATE = 42                   # Random seed for reproducibility
+
+# Committee Model Parameters
+RF_N_ESTIMATORS = 300                   # Random Forest tree count
+RF_MIN_SAMPLES_LEAF = 2                 # Random Forest minimum samples per leaf
+ET_N_ESTIMATORS = 300                   # Extra Trees tree count
+ET_MIN_SAMPLES_LEAF = 2                 # Extra Trees minimum samples per leaf
+RIDGE_ALPHA = 1.0                       # Ridge regression alpha (L2 penalty)
 
 
 # ============================================================
@@ -676,7 +693,7 @@ def get_target_columns() -> List[str]:
     return target_cols
 
 
-def build_committee(random_state: int = 42) -> List[Pipeline]:
+def build_committee(random_state: int = QBC_RANDOM_STATE) -> List[Pipeline]:
     """
     Bygger en lille committee af forskellige regressionsmodeller.
     """
@@ -684,8 +701,8 @@ def build_committee(random_state: int = 42) -> List[Pipeline]:
         Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("model", RandomForestRegressor(
-                n_estimators=300,
-                min_samples_leaf=2,
+                n_estimators=RF_N_ESTIMATORS,
+                min_samples_leaf=RF_MIN_SAMPLES_LEAF,
                 random_state=random_state,
                 n_jobs=-1,
             ))
@@ -693,8 +710,8 @@ def build_committee(random_state: int = 42) -> List[Pipeline]:
         Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("model", ExtraTreesRegressor(
-                n_estimators=300,
-                min_samples_leaf=2,
+                n_estimators=ET_N_ESTIMATORS,
+                min_samples_leaf=ET_MIN_SAMPLES_LEAF,
                 random_state=random_state + 1,
                 n_jobs=-1,
             ))
@@ -702,7 +719,7 @@ def build_committee(random_state: int = 42) -> List[Pipeline]:
         Pipeline([
             ("imputer", SimpleImputer(strategy="median")),
             ("scaler", StandardScaler()),
-            ("model", Ridge(alpha=1.0))
+            ("model", Ridge(alpha=RIDGE_ALPHA))
         ]),
     ]
 
@@ -777,10 +794,10 @@ def committee_mean_prediction(
 
 def train_qbc_model(
     df_feat: pd.DataFrame,
-    initial_labeled_size: int = 80,
-    query_batch_size: int = 12,
-    n_queries: int = 25,
-    random_state: int = 42,
+    initial_labeled_size: int = QBC_INITIAL_LABELED_SIZE,
+    query_batch_size: int = QBC_QUERY_BATCH_SIZE,
+    n_queries: int = QBC_N_QUERIES,
+    random_state: int = QBC_RANDOM_STATE,
 ) -> QBCResult:
     """
     Træner multi-output QBC model med 16 targets.
@@ -997,250 +1014,6 @@ def train_qbc_model(
         final_selected_points=last_selected_points_df,
     )
 
-def train_random_baseline(
-    df_feat: pd.DataFrame,
-    initial_labeled_size: int = 80,
-    query_batch_size: int = 12,
-    n_queries: int = 25,
-    random_state: int = 42,
-) -> pd.DataFrame:
-    """
-    Random sampling baseline for active learning.
-
-    Same setup as QBC:
-    - same train/test split
-    - same initial labeled size
-    - same query batch size
-    - same number of iterations
-    - same committee
-
-    Difference:
-    - samples are chosen uniformly at random from the pool
-      instead of by committee disagreement.
-
-    Returns:
-        DataFrame with learning curve:
-        iteration, labeled_size, pool_size, test_mae, test_rmse
-    """
-    rng = np.random.default_rng(random_state)
-
-    feature_cols = get_feature_columns()
-    target_cols = get_target_columns()
-
-    # Train/test split (same as QBC)
-    split_idx = int(len(df_feat) * 0.8)
-    train_df = df_feat.iloc[:split_idx].copy()
-    test_df = df_feat.iloc[split_idx:].copy()
-
-    X_train_full = train_df[feature_cols].reset_index(drop=True)
-    y_train_full = train_df[target_cols].reset_index(drop=True)
-
-    X_test = test_df[feature_cols].reset_index(drop=True)
-    y_test = test_df[target_cols].reset_index(drop=True)
-
-    if initial_labeled_size >= len(X_train_full):
-        raise ValueError("initial_labeled_size er for stor i forhold til train-datasættet.")
-
-    # Initial split
-    X_labeled = X_train_full.iloc[:initial_labeled_size].copy()
-    y_labeled = y_train_full.iloc[:initial_labeled_size].copy()
-
-    X_pool = X_train_full.iloc[initial_labeled_size:].copy()
-    y_pool = y_train_full.iloc[initial_labeled_size:].copy()
-
-    base_committee = build_committee(random_state=random_state)
-    learning_curve_rows = []
-
-    logging.info(f"\n⏳ Starting RANDOM baseline loop ({n_queries} iterations, seed={random_state})...")
-
-    for step in tqdm(range(n_queries), desc=f"Random Baseline {random_state}", unit="it"):
-        if len(X_pool) == 0:
-            tqdm.write(f"  ℹ Pool exhausted at iteration {step}")
-            break
-
-        # Train committee on currently labeled data
-        fitted_committee = fit_committee(base_committee, X_labeled, y_labeled)
-
-        # Evaluate on test set
-        test_pred = committee_mean_prediction(fitted_committee, X_test)
-        mae = mean_absolute_error(y_test.values.flatten(), test_pred.flatten())
-        rmse = float(np.sqrt(mean_squared_error(y_test.values.flatten(), test_pred.flatten())))
-
-        learning_curve_rows.append({
-            "iteration": step,
-            "labeled_size": len(X_labeled),
-            "pool_size": len(X_pool),
-            "test_mae": mae,
-            "test_rmse": rmse,
-        })
-
-        # Random selection instead of QBC disagreement
-        n_select = min(query_batch_size, len(X_pool))
-        query_indices = rng.choice(len(X_pool), size=n_select, replace=False)
-        query_indices = np.sort(query_indices)
-
-        # Move selected samples from pool to labeled
-        X_new = X_pool.iloc[query_indices].copy()
-        y_new = y_pool.iloc[query_indices].copy()
-
-        X_labeled = pd.concat([X_labeled, X_new], ignore_index=True)
-        y_labeled = pd.concat([y_labeled, y_new], ignore_index=True)
-
-        # Update pool
-        keep_mask = np.ones(len(X_pool), dtype=bool)
-        keep_mask[query_indices] = False
-
-        X_pool = X_pool.iloc[keep_mask].reset_index(drop=True)
-        y_pool = y_pool.iloc[keep_mask].reset_index(drop=True)
-
-    return pd.DataFrame(learning_curve_rows)
-
-
-def run_random_baseline_repeated(
-    df_feat: pd.DataFrame,
-    initial_labeled_size: int = 80,
-    query_batch_size: int = 12,
-    n_queries: int = 25,
-    base_random_state: int = 100,
-    n_repeats: int = 10,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Run the random baseline multiple times to get a fairer comparison
-    against a single QBC run.
-
-    Returns:
-        all_runs_df: one row per iteration per repeat
-        summary_df: mean/std per iteration
-    """
-    all_runs = []
-
-    logging.info(f"\n⏳ Running random baseline {n_repeats} times...")
-    for repeat in range(n_repeats):
-        seed = base_random_state + repeat
-
-        curve_df = train_random_baseline(
-            df_feat=df_feat,
-            initial_labeled_size=initial_labeled_size,
-            query_batch_size=query_batch_size,
-            n_queries=n_queries,
-            random_state=seed,
-        ).copy()
-
-        curve_df["repeat"] = repeat
-        curve_df["seed"] = seed
-        all_runs.append(curve_df)
-
-    all_runs_df = pd.concat(all_runs, ignore_index=True)
-
-    summary_df = (
-        all_runs_df
-        .groupby(["iteration", "labeled_size"], as_index=False)
-        .agg(
-            random_mae_mean=("test_mae", "mean"),
-            random_mae_std=("test_mae", "std"),
-            random_rmse_mean=("test_rmse", "mean"),
-            random_rmse_std=("test_rmse", "std"),
-        )
-        .sort_values("iteration")
-        .reset_index(drop=True)
-    )
-
-    # std can be NaN if n_repeats == 1
-    for col in ["random_mae_std", "random_rmse_std"]:
-        summary_df[col] = summary_df[col].fillna(0.0)
-
-    return all_runs_df, summary_df
-
-
-def plot_qbc_vs_random(
-    qbc_learning_curve: pd.DataFrame,
-    random_summary_df: pd.DataFrame,
-    save_path: str = "plots/qbc_vs_random_baseline.png",
-) -> None:
-    """
-    Plot QBC learning curve against repeated random baseline.
-    Saves a graph showing whether QBC performs better on this dataset.
-
-    Lower is better for both MAE and RMSE.
-    """
-    if qbc_learning_curve.empty:
-        logging.info("Ingen QBC learning curve data.")
-        return
-
-    if random_summary_df.empty:
-        logging.info("Ingen random baseline data.")
-        return
-
-    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
-
-    # --- MAE ---
-    axes[0].plot(
-        qbc_learning_curve["labeled_size"],
-        qbc_learning_curve["test_mae"],
-        marker="o",
-        linewidth=2.5,
-        label="QBC MAE",
-    )
-
-    axes[0].plot(
-        random_summary_df["labeled_size"],
-        random_summary_df["random_mae_mean"],
-        marker="s",
-        linewidth=2.5,
-        label="Random baseline MAE (mean)",
-    )
-
-    axes[0].fill_between(
-        random_summary_df["labeled_size"],
-        random_summary_df["random_mae_mean"] - random_summary_df["random_mae_std"],
-        random_summary_df["random_mae_mean"] + random_summary_df["random_mae_std"],
-        alpha=0.2,
-        label="Random baseline ±1 std",
-    )
-
-    axes[0].set_title("QBC vs Random Baseline — MAE")
-    axes[0].set_ylabel("Test MAE")
-    axes[0].grid(True, alpha=0.3)
-    axes[0].legend()
-
-    # --- RMSE ---
-    axes[1].plot(
-        qbc_learning_curve["labeled_size"],
-        qbc_learning_curve["test_rmse"],
-        marker="o",
-        linewidth=2.5,
-        label="QBC RMSE",
-    )
-
-    axes[1].plot(
-        random_summary_df["labeled_size"],
-        random_summary_df["random_rmse_mean"],
-        marker="s",
-        linewidth=2.5,
-        label="Random baseline RMSE (mean)",
-    )
-
-    axes[1].fill_between(
-        random_summary_df["labeled_size"],
-        random_summary_df["random_rmse_mean"] - random_summary_df["random_rmse_std"],
-        random_summary_df["random_rmse_mean"] + random_summary_df["random_rmse_std"],
-        alpha=0.2,
-        label="Random baseline ±1 std",
-    )
-
-    axes[1].set_title("QBC vs Random Baseline — RMSE")
-    axes[1].set_xlabel("Number of labeled samples")
-    axes[1].set_ylabel("Test RMSE")
-    axes[1].grid(True, alpha=0.3)
-    axes[1].legend()
-
-    plt.tight_layout()
-    os.makedirs("plots", exist_ok=True)
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    plt.close()
-
-    logging.info(f"  ✓ Saved {save_path}")
-
 
 # ============================================================
 # Metric Computation Functions
@@ -1424,6 +1197,254 @@ def format_standardized_metrics(std_metrics: Dict[str, any], std_factors: Dict[s
             output += f"  {horizon:>4}:  Normalized MAE = {norm_mae:.4f}\n"
     
     return output
+
+
+# ============================================================
+# Baseline Comparison Functions
+# ============================================================
+def train_random_baseline(
+    df_feat: pd.DataFrame,
+    initial_labeled_size: int = 80,
+    query_batch_size: int = 12,
+    n_queries: int = 25,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """
+    Random sampling baseline for active learning.
+
+    Same setup as QBC:
+    - same train/test split
+    - same initial labeled size
+    - same query batch size
+    - same number of iterations
+    - same committee
+
+    Difference:
+    - samples are chosen uniformly at random from the pool
+      instead of by committee disagreement.
+
+    Returns:
+        DataFrame with learning curve:
+        iteration, labeled_size, pool_size, test_mae, test_rmse
+    """
+    rng = np.random.default_rng(random_state)
+
+    feature_cols = get_feature_columns()
+    target_cols = get_target_columns()
+
+    # Train/test split (same as QBC)
+    split_idx = int(len(df_feat) * 0.8)
+    train_df = df_feat.iloc[:split_idx].copy()
+    test_df = df_feat.iloc[split_idx:].copy()
+
+    X_train_full = train_df[feature_cols].reset_index(drop=True)
+    y_train_full = train_df[target_cols].reset_index(drop=True)
+
+    X_test = test_df[feature_cols].reset_index(drop=True)
+    y_test = test_df[target_cols].reset_index(drop=True)
+
+    if initial_labeled_size >= len(X_train_full):
+        raise ValueError("initial_labeled_size er for stor i forhold til train-datasættet.")
+
+    # Initial split
+    X_labeled = X_train_full.iloc[:initial_labeled_size].copy()
+    y_labeled = y_train_full.iloc[:initial_labeled_size].copy()
+
+    X_pool = X_train_full.iloc[initial_labeled_size:].copy()
+    y_pool = y_train_full.iloc[initial_labeled_size:].copy()
+
+    base_committee = build_committee(random_state=random_state)
+    learning_curve_rows = []
+
+    logging.info(f"\n⏳ Starting RANDOM baseline loop ({n_queries} iterations, seed={random_state})...")
+
+    for step in tqdm(range(n_queries), desc=f"Random Baseline {random_state}", unit="it"):
+        if len(X_pool) == 0:
+            tqdm.write(f"  ℹ Pool exhausted at iteration {step}")
+            break
+
+        # Train committee on currently labeled data
+        fitted_committee = fit_committee(base_committee, X_labeled, y_labeled)
+
+        # Evaluate on test set
+        test_pred = committee_mean_prediction(fitted_committee, X_test)
+        mae = mean_absolute_error(y_test.values.flatten(), test_pred.flatten())
+        rmse = float(np.sqrt(mean_squared_error(y_test.values.flatten(), test_pred.flatten())))
+
+        learning_curve_rows.append({
+            "iteration": step,
+            "labeled_size": len(X_labeled),
+            "pool_size": len(X_pool),
+            "test_mae": mae,
+            "test_rmse": rmse,
+        })
+
+        # Random selection instead of QBC disagreement
+        n_select = min(query_batch_size, len(X_pool))
+        query_indices = rng.choice(len(X_pool), size=n_select, replace=False)
+        query_indices = np.sort(query_indices)
+
+        # Move selected samples from pool to labeled
+        X_new = X_pool.iloc[query_indices].copy()
+        y_new = y_pool.iloc[query_indices].copy()
+
+        X_labeled = pd.concat([X_labeled, X_new], ignore_index=True)
+        y_labeled = pd.concat([y_labeled, y_new], ignore_index=True)
+
+        # Update pool
+        keep_mask = np.ones(len(X_pool), dtype=bool)
+        keep_mask[query_indices] = False
+
+        X_pool = X_pool.iloc[keep_mask].reset_index(drop=True)
+        y_pool = y_pool.iloc[keep_mask].reset_index(drop=True)
+
+    return pd.DataFrame(learning_curve_rows)
+
+
+def run_random_baseline_repeated(
+    df_feat: pd.DataFrame,
+    initial_labeled_size: int = 80,
+    query_batch_size: int = 12,
+    n_queries: int = 25,
+    base_random_state: int = 100,
+    n_repeats: int = 10,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Run the random baseline multiple times to get a fairer comparison
+    against a single QBC run.
+
+    Returns:
+        all_runs_df: one row per iteration per repeat
+        summary_df: mean/std per iteration
+    """
+    all_runs = []
+
+    logging.info(f"\n⏳ Running random baseline {n_repeats} times...")
+    for repeat in range(n_repeats):
+        seed = base_random_state + repeat
+
+        curve_df = train_random_baseline(
+            df_feat=df_feat,
+            initial_labeled_size=initial_labeled_size,
+            query_batch_size=query_batch_size,
+            n_queries=n_queries,
+            random_state=seed,
+        ).copy()
+
+        curve_df["repeat"] = repeat
+        curve_df["seed"] = seed
+        all_runs.append(curve_df)
+
+    all_runs_df = pd.concat(all_runs, ignore_index=True)
+
+    summary_df = (
+        all_runs_df
+        .groupby(["iteration", "labeled_size"], as_index=False)
+        .agg(
+            random_mae_mean=("test_mae", "mean"),
+            random_mae_std=("test_mae", "std"),
+            random_rmse_mean=("test_rmse", "mean"),
+            random_rmse_std=("test_rmse", "std"),
+        )
+        .sort_values("iteration")
+        .reset_index(drop=True)
+    )
+
+    # std can be NaN if n_repeats == 1
+    for col in ["random_mae_std", "random_rmse_std"]:
+        summary_df[col] = summary_df[col].fillna(0.0)
+
+    return all_runs_df, summary_df
+
+
+def plot_qbc_vs_random(
+    qbc_learning_curve: pd.DataFrame,
+    random_summary_df: pd.DataFrame,
+    save_path: str = f"plots/{timestamp}/qbc_vs_random_baseline.png",
+) -> None:
+    """
+    Plot QBC learning curve against repeated random baseline.
+    Saves a graph showing whether QBC performs better on this dataset.
+
+    Lower is better for both MAE and RMSE.
+    """
+    if qbc_learning_curve.empty:
+        logging.info("Ingen QBC learning curve data.")
+        return
+
+    if random_summary_df.empty:
+        logging.info("Ingen random baseline data.")
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+
+    # --- MAE ---
+    axes[0].plot(
+        qbc_learning_curve["labeled_size"],
+        qbc_learning_curve["test_mae"],
+        marker="o",
+        linewidth=2.5,
+        label="QBC MAE",
+    )
+
+    axes[0].plot(
+        random_summary_df["labeled_size"],
+        random_summary_df["random_mae_mean"],
+        marker="s",
+        linewidth=2.5,
+        label="Random baseline MAE (mean)",
+    )
+
+    axes[0].fill_between(
+        random_summary_df["labeled_size"],
+        random_summary_df["random_mae_mean"] - random_summary_df["random_mae_std"],
+        random_summary_df["random_mae_mean"] + random_summary_df["random_mae_std"],
+        alpha=0.2,
+        label="Random baseline ±1 std",
+    )
+
+    axes[0].set_title("QBC vs Random Baseline — MAE")
+    axes[0].set_ylabel("Test MAE")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+
+    # --- RMSE ---
+    axes[1].plot(
+        qbc_learning_curve["labeled_size"],
+        qbc_learning_curve["test_rmse"],
+        marker="o",
+        linewidth=2.5,
+        label="QBC RMSE",
+    )
+
+    axes[1].plot(
+        random_summary_df["labeled_size"],
+        random_summary_df["random_rmse_mean"],
+        marker="s",
+        linewidth=2.5,
+        label="Random baseline RMSE (mean)",
+    )
+
+    axes[1].fill_between(
+        random_summary_df["labeled_size"],
+        random_summary_df["random_rmse_mean"] - random_summary_df["random_rmse_std"],
+        random_summary_df["random_rmse_mean"] + random_summary_df["random_rmse_std"],
+        alpha=0.2,
+        label="Random baseline ±1 std",
+    )
+
+    axes[1].set_title("QBC vs Random Baseline — RMSE")
+    axes[1].set_xlabel("Number of labeled samples")
+    axes[1].set_ylabel("Test RMSE")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+
+    plt.tight_layout()
+    os.makedirs(f"plots/{timestamp}", exist_ok=True)
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+
+    logging.info(f"  ✓ Saved {save_path}")
 
 
 # ============================================================
@@ -1679,27 +1700,10 @@ def main() -> None:
     logging.info(f"\n⏳ Training QBC model with multi-output regression...")
     qbc_result = train_qbc_model(
         feat_df,
-        initial_labeled_size=80,
-        query_batch_size=12,
-        n_queries=25,
-        random_state=42,
-    )
-
-    logging.info(f"\n⏳ Running random-sampling baseline for comparison...")
-    random_runs_df, random_summary_df = run_random_baseline_repeated(
-        feat_df,
-        initial_labeled_size=80,
-        query_batch_size=12,
-        n_queries=25,
-        base_random_state=100,
-        n_repeats=10,   # increase to 20 for a more stable estimate
-    )
-
-    logging.info(f"\n⏳ Plotting QBC vs random baseline...")
-    plot_qbc_vs_random(
-        qbc_learning_curve=qbc_result.learning_curve,
-        random_summary_df=random_summary_df,
-        save_path="plots/qbc_vs_random_baseline.png",
+        initial_labeled_size=QBC_INITIAL_LABELED_SIZE,
+        query_batch_size=QBC_QUERY_BATCH_SIZE,
+        n_queries=QBC_N_QUERIES,
+        random_state=QBC_RANDOM_STATE,
     )
 
     logging.info(f"\n⏳ Plotting QBC results...")
@@ -1763,6 +1767,24 @@ def main() -> None:
     std_output = format_standardized_metrics(std_metrics, STANDARDIZATION_FACTORS)
     logging.info(std_output)
 
+    # Run baseline comparison (random sampling)
+    logging.info(f"\n⏳ Running random baseline comparison ({10} repeats)...")
+    random_runs_df, random_summary_df = run_random_baseline_repeated(
+        feat_df,
+        initial_labeled_size=QBC_INITIAL_LABELED_SIZE,
+        query_batch_size=QBC_QUERY_BATCH_SIZE,
+        n_queries=QBC_N_QUERIES,
+        base_random_state=100,
+        n_repeats=10,
+    )
+    
+    logging.info(f"\n⏳ Plotting QBC vs Random Baseline...")
+    plot_qbc_vs_random(
+        qbc_result.learning_curve,
+        random_summary_df,
+        save_path="plots/qbc_vs_random_baseline.png",
+    )
+    
     # Save results to CSV files
     logging.info("\n⏳ Saving results to CSV files...")
     os.makedirs("data", exist_ok=True)
@@ -1785,12 +1807,6 @@ def main() -> None:
     logging.info("  • Saving learning curve...")
     learning_curve_df.to_csv("data/dmi_qbc_learning_curve.csv", index=False)
     
-    logging.info("  • Saving random baseline runs...")
-    random_runs_df.to_csv("data/dmi_random_baseline_runs.csv", index=False)
-
-    logging.info("  • Saving random baseline summary...")
-    random_summary_df.to_csv("data/dmi_random_baseline_summary.csv", index=False)
-
     logging.info("  • Saving pool disagreement...")
     disagreement_df.to_csv("data/dmi_qbc_pool_disagreement.csv", index=False)
     
@@ -1799,6 +1815,10 @@ def main() -> None:
     
     logging.info("  • Saving selected points...")
     qbc_result.final_selected_points.to_csv("data/dmi_qbc_selected_points.csv", index=False)
+    
+    logging.info("  • Saving random baseline results...")
+    random_runs_df.to_csv("data/dmi_random_baseline_runs.csv", index=False)
+    random_summary_df.to_csv("data/dmi_random_baseline_summary.csv", index=False)
     
     # Save metrics tables
     logging.info("  • Saving per-variable, per-horizon metrics...")
@@ -1846,14 +1866,14 @@ def main() -> None:
     logging.info("  • dmi_qbc_pool_disagreement.csv")
     logging.info("  • dmi_qbc_final_pool_predictions.csv")
     logging.info("  • dmi_qbc_selected_points.csv")
-    logging.info("  • dmi_metrics_by_variable_horizon.csv")
-    logging.info("  • dmi_metrics_standardized.csv")
     logging.info("  • dmi_random_baseline_runs.csv")
     logging.info("  • dmi_random_baseline_summary.csv")
+    logging.info("  • dmi_metrics_by_variable_horizon.csv")
+    logging.info("  • dmi_metrics_standardized.csv")
     logging.info("\nPlot files created:")
     logging.info(f"  • plots/{timestamp}/qbc_learning_curve.png")
     logging.info(f"  • plots/{timestamp}/qbc_selection.png")
-    logging.info(f"  • plots/{timestamp}/qbc_vs_random_baseline.png")
+    logging.info(f"  • plots/qbc_vs_random_baseline.png")
 
 
 if __name__ == "__main__":
