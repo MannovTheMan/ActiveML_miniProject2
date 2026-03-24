@@ -51,6 +51,9 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+# ============================================================
+# Logging (console output saved in timestamped log file)
+# ============================================================
 
 os.makedirs("logs", exist_ok=True)
 timestamp = datetime.now().strftime("%d-%b-%Y_%H-%M-%S")
