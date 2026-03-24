@@ -84,6 +84,9 @@ logger.addHandler(console_handler)
 # ============================================================
 # Konfiguration
 # ============================================================
+os.makedirs("plots", exist_ok=True)
+os.makedirs("data", exist_ok=True)
+
 BASE_URL = "https://opendataapi.dmi.dk/v2/climateData"
 COPENHAGEN_TZ = "Europe/Copenhagen"
 
@@ -1230,8 +1233,8 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
     axes[1].grid(True, alpha=0.3)
 
     plt.tight_layout()
-    os.makedirs("plots", exist_ok=True)
-    plt.savefig("plots/qbc_selection.png")
+    os.makedirs(f"plots/{timestamp}", exist_ok=True)
+    plt.savefig(f"plots/{timestamp}/qbc_selection.png")
 
 
 def plot_qbc_learning_curve(result: QBCResult) -> None:
@@ -1256,8 +1259,8 @@ def plot_qbc_learning_curve(result: QBCResult) -> None:
     ax.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    os.makedirs("plots", exist_ok=True)
-    plt.savefig("plots/qbc_learning_curve.png")
+    os.makedirs(f"plots/{timestamp}", exist_ok=True)
+    plt.savefig(f"plots/{timestamp}/qbc_learning_curve.png")
 
 
 def plot_predictions_per_variable_horizon(pred_df: pd.DataFrame, target_cols: List[str]) -> None:
@@ -1309,8 +1312,8 @@ def plot_predictions_per_variable_horizon(pred_df: pd.DataFrame, target_cols: Li
             axes[horizon_idx].grid(True, alpha=0.3, linestyle='--')
         
         plt.tight_layout()
-        os.makedirs("plots", exist_ok=True)
-        plot_filename = f"plots/predictions_{var}.png"
+        os.makedirs(f"plots/{timestamp}", exist_ok=True)
+        plot_filename = f"plots/{timestamp}/predictions_{var}.png"
         plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
         plt.close()
         logging.info(f"  ✓ Saved {plot_filename}")
@@ -1374,8 +1377,8 @@ def plot_error_degradation(pred_df: pd.DataFrame, target_cols: List[str]) -> Non
                                   ha='center', fontsize=10, fontweight='bold')
     
     plt.tight_layout()
-    os.makedirs("plots", exist_ok=True)
-    plot_filename = "plots/error_degradation.png"
+    os.makedirs(f"plots/{timestamp}", exist_ok=True)
+    plot_filename = f"plots/{timestamp}/error_degradation.png"
     plt.savefig(plot_filename, dpi=150, bbox_inches='tight')
     plt.close()
     logging.info(f"  ✓ Saved {plot_filename}")
@@ -1561,8 +1564,8 @@ def main() -> None:
     logging.info("  • dmi_metrics_by_variable_horizon.csv")
     logging.info("  • dmi_metrics_standardized.csv")
     logging.info("\nPlot files created:")
-    logging.info("  • plots/qbc_learning_curve.png")
-    logging.info("  • plots/qbc_selection.png")
+    logging.info(f"  • plots/{timestamp}/qbc_learning_curve.png")
+    logging.info(f"  • plots/{timestamp}/qbc_selection.png")
 
 
 if __name__ == "__main__":
