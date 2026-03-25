@@ -107,10 +107,7 @@ os.makedirs("data", exist_ok=True)
 
 # Disable parallelisation warnings
 import warnings
-warnings.filterwarnings(
-    "ignore",
-    message="`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`"
-)
+warnings.filterwarnings("ignore", module="sklearn")
 
 
 BASE_URL = "https://opendataapi.dmi.dk/v2/climateData"
@@ -158,7 +155,7 @@ STANDARDIZATION_FACTORS: Dict[str, float] = {
 # QBC and Model Configuration
 # ============================================================
 # Active Learning Parameters
-QBC_INITIAL_LABELED_SIZE = 10           # Number of samples to start with
+QBC_INITIAL_LABELED_SIZE = 80           # Number of samples to start with
 QBC_QUERY_BATCH_SIZE = 1                # Number of samples to query per iteration
 QBC_N_QUERIES = 20                      # Number of active learning iterations
 
@@ -939,10 +936,10 @@ def train_qbc_model(
         for model_idx in range(len(fitted_committee)):
             if pred_matrix.ndim == 3:
                 # Multi-output
-                pool_pred_dict[f"model_{fitted_committee[model_idx]}_pred_mean"] = pred_matrix[model_idx].mean(axis=1)
+                pool_pred_dict[f"model_{fitted_committee[model_idx].named_steps["model"].__class__.__name__}_pred_mean"] = pred_matrix[model_idx].mean(axis=1)
             else:
                 # Single-output
-                pool_pred_dict[f"model_{fitted_committee[model_idx]}_pred"] = pred_matrix[model_idx]
+                pool_pred_dict[f"model_{fitted_committee[model_idx].named_steps["model"].__class__.__name__}_pred"] = pred_matrix[model_idx]
 
         iteration_pool_predictions_df = pd.DataFrame(pool_pred_dict)
         iteration_pool_predictions_df.loc[query_indices, "selected_by_qbc"] = True
@@ -1517,11 +1514,11 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
                 selected_df["committee_mean"],
                 s=70,
                 marker="o",
-                label="QBC selected",
+                label="QBC valgt",
             )
 
-    axes[0].set_title("Komitéens forudsigelser på unlabeled pool")
-    axes[0].set_ylabel("Forudsagt værdi (aggregeret over 16 mål)")
+    axes[0].set_title("Komité forudsigelser på unlabeled pool (last iteration)")
+    axes[0].set_ylabel("Forudsagt værdi")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 

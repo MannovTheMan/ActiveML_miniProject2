@@ -1,3 +1,8 @@
-data
-plots
-logs
+data/
+logs/
+
+plots/*
+!plots/25-Mar-2026-21-16-39/
+!plots/25-Mar-2026-21-22-54/
+!plots/25-Mar-2026-21-27-13/
+!plots/25-Mar-2026-21-36-54/
