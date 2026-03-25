@@ -105,6 +105,14 @@ debug_logger.addHandler(debug_handler)
 os.makedirs("plots", exist_ok=True)
 os.makedirs("data", exist_ok=True)
 
+# Disable parallelisation warnings
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="`sklearn.utils.parallel.delayed` should be used with `sklearn.utils.parallel.Parallel`"
+)
+
+
 BASE_URL = "https://opendataapi.dmi.dk/v2/climateData"
 COPENHAGEN_TZ = "Europe/Copenhagen"
 
@@ -150,10 +158,12 @@ STANDARDIZATION_FACTORS: Dict[str, float] = {
 # QBC and Model Configuration
 # ============================================================
 # Active Learning Parameters
-QBC_INITIAL_LABELED_SIZE = 80           # Number of samples to start with
+QBC_INITIAL_LABELED_SIZE = 10           # Number of samples to start with
 QBC_QUERY_BATCH_SIZE = 1                # Number of samples to query per iteration
-QBC_N_QUERIES = 25                      # Number of active learning iterations
-QBC_RANDOM_STATE = 42                   # Random seed for reproducibility
+QBC_N_QUERIES = 20                      # Number of active learning iterations
+
+INITIAL_RANDOM_STATE = 42               # Random seed for reproducibility
+NUM_OF_REPS = 4                         # Numer of random baselines trained with different seeds for the random query-points chosen after the initial training.
 
 # Committee Model Parameters
 RF_N_ESTIMATORS = 300                   # Random Forest tree count
@@ -693,7 +703,7 @@ def get_target_columns() -> List[str]:
     return target_cols
 
 
-def build_committee(random_state: int = QBC_RANDOM_STATE) -> List[Pipeline]:
+def build_committee(random_state: int = INITIAL_RANDOM_STATE) -> List[Pipeline]:
     """
     Bygger en lille committee af forskellige regressionsmodeller.
     """
@@ -797,7 +807,7 @@ def train_qbc_model(
     initial_labeled_size: int = QBC_INITIAL_LABELED_SIZE,
     query_batch_size: int = QBC_QUERY_BATCH_SIZE,
     n_queries: int = QBC_N_QUERIES,
-    random_state: int = QBC_RANDOM_STATE,
+    random_state: int = INITIAL_RANDOM_STATE,
 ) -> QBCResult:
     """
     Træner multi-output QBC model med 16 targets.
@@ -813,6 +823,7 @@ def train_qbc_model(
         QBCResult with multi-output predictions and metrics
     """
     logging.info("\n⏳ Setting up QBC training...")
+    rng = np.random.default_rng(random_state)
     feature_cols = get_feature_columns()
     target_cols = get_target_columns()
     
@@ -833,14 +844,18 @@ def train_qbc_model(
     if initial_labeled_size >= len(X_train_full):
         raise ValueError("initial_labeled_size er for stor i forhold til train-datasættet.")
 
-    # Initial split: labeled and pool
-    X_labeled = X_train_full.iloc[:initial_labeled_size].copy()
-    y_labeled = y_train_full.iloc[:initial_labeled_size].copy()
+    # Initial split
+    initial_indices = rng.choice(len(X_train_full), size=initial_labeled_size, replace=False)  # randomly select {initial_labeled_size} datapoints from X_train
+    X_labeled = X_train_full.iloc[initial_indices].copy()
+    y_labeled = y_train_full.iloc[initial_indices].copy()
 
-    X_pool = X_train_full.iloc[initial_labeled_size:].copy()
-    y_pool = y_train_full.iloc[initial_labeled_size:].copy()
+    # Create the remaining pool:
+    X_pool = X_train_full.drop(initial_indices)
+    y_pool = y_train_full.drop(initial_indices)
 
-    ts_pool = train_df.iloc[initial_labeled_size:]["timestamp_local"].reset_index(drop=True)
+    # Align pool timestamps to the same rows that are still in X_pool
+    pool_indices = np.setdiff1d(np.arange(len(train_df)), initial_indices)
+    ts_pool = train_df.iloc[pool_indices]["timestamp_local"].reset_index(drop=True)
     ts_test = test_df["timestamp_local"].reset_index(drop=True)
 
     logging.info(f"\n⏳ Train/test split:")
@@ -924,10 +939,10 @@ def train_qbc_model(
         for model_idx in range(len(fitted_committee)):
             if pred_matrix.ndim == 3:
                 # Multi-output
-                pool_pred_dict[f"model_{model_idx+1}_pred_mean"] = pred_matrix[model_idx].mean(axis=1)
+                pool_pred_dict[f"model_{fitted_committee[model_idx]}_pred_mean"] = pred_matrix[model_idx].mean(axis=1)
             else:
                 # Single-output
-                pool_pred_dict[f"model_{model_idx+1}_pred"] = pred_matrix[model_idx]
+                pool_pred_dict[f"model_{fitted_committee[model_idx]}_pred"] = pred_matrix[model_idx]
 
         iteration_pool_predictions_df = pd.DataFrame(pool_pred_dict)
         iteration_pool_predictions_df.loc[query_indices, "selected_by_qbc"] = True
@@ -1207,7 +1222,8 @@ def train_random_baseline(
     initial_labeled_size: int = 80,
     query_batch_size: int = 12,
     n_queries: int = 25,
-    random_state: int = 42,
+    initial_seed: int = INITIAL_RANDOM_STATE,
+    run_seed: int = 100,
 ) -> pd.DataFrame:
     """
     Random sampling baseline for active learning.
@@ -1227,7 +1243,13 @@ def train_random_baseline(
         DataFrame with learning curve:
         iteration, labeled_size, pool_size, test_mae, test_rmse
     """
-    rng = np.random.default_rng(random_state)
+    
+    # RNG for initial labeled set (shared with QBC)
+    initial_rng = np.random.default_rng(initial_seed)
+
+    # RNG for random sampling inside AL loop (unique for each repeat)
+    run_rng = np.random.default_rng(run_seed)
+
 
     feature_cols = get_feature_columns()
     target_cols = get_target_columns()
@@ -1247,18 +1269,24 @@ def train_random_baseline(
         raise ValueError("initial_labeled_size er for stor i forhold til train-datasættet.")
 
     # Initial split
-    X_labeled = X_train_full.iloc[:initial_labeled_size].copy()
-    y_labeled = y_train_full.iloc[:initial_labeled_size].copy()
+    initial_indices = initial_rng.choice(len(X_train_full), size=initial_labeled_size, replace=False) # randomly select {initial_labeled_size} datapoints from X_train
+    X_labeled = X_train_full.iloc[initial_indices].copy()
+    y_labeled = y_train_full.iloc[initial_indices].copy()
 
-    X_pool = X_train_full.iloc[initial_labeled_size:].copy()
-    y_pool = y_train_full.iloc[initial_labeled_size:].copy()
+    # Create the remaining pool:
+    X_pool = X_train_full.drop(initial_indices)
+    y_pool = y_train_full.drop(initial_indices)
 
-    base_committee = build_committee(random_state=random_state)
+
+    base_committee = build_committee(random_state=initial_seed)
     learning_curve_rows = []
 
-    logging.info(f"\n⏳ Starting RANDOM baseline loop ({n_queries} iterations, seed={random_state})...")
+    logging.info(
+        f"\n⏳ Starting RANDOM baseline loop ({n_queries} iterations, "
+        f"initial_seed={initial_seed}, run_seed={run_seed})..."
+    )
 
-    for step in tqdm(range(n_queries), desc=f"Random Baseline {random_state}", unit="it"):
+    for step in tqdm(range(n_queries), desc=f"Random Baseline (run_seed={run_seed})", unit="it"):
         if len(X_pool) == 0:
             tqdm.write(f"  ℹ Pool exhausted at iteration {step}")
             break
@@ -1281,7 +1309,7 @@ def train_random_baseline(
 
         # Random selection instead of QBC disagreement
         n_select = min(query_batch_size, len(X_pool))
-        query_indices = rng.choice(len(X_pool), size=n_select, replace=False)
+        query_indices = run_rng.choice(len(X_pool), size=n_select, replace=False)
         query_indices = np.sort(query_indices)
 
         # Move selected samples from pool to labeled
@@ -1307,7 +1335,7 @@ def run_random_baseline_repeated(
     query_batch_size: int = 12,
     n_queries: int = 25,
     base_random_state: int = 100,
-    n_repeats: int = 10,
+    n_repeats: int = NUM_OF_REPS,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Run the random baseline multiple times to get a fairer comparison
@@ -1328,7 +1356,8 @@ def run_random_baseline_repeated(
             initial_labeled_size=initial_labeled_size,
             query_batch_size=query_batch_size,
             n_queries=n_queries,
-            random_state=seed,
+            initial_seed=INITIAL_RANDOM_STATE,
+            run_seed=seed
         ).copy()
 
         curve_df["repeat"] = repeat
@@ -1400,10 +1429,11 @@ def plot_qbc_vs_random(
         random_summary_df["random_mae_mean"] - random_summary_df["random_mae_std"],
         random_summary_df["random_mae_mean"] + random_summary_df["random_mae_std"],
         alpha=0.2,
+        color="orange",
         label="Random baseline ±1 std",
     )
 
-    axes[0].set_title("QBC vs Random Baseline — MAE")
+    axes[0].set_title("QBC vs Tilfældig Baseline — MAE")
     axes[0].set_ylabel("Test MAE")
     axes[0].grid(True, alpha=0.3)
     axes[0].legend()
@@ -1422,19 +1452,20 @@ def plot_qbc_vs_random(
         random_summary_df["random_rmse_mean"],
         marker="s",
         linewidth=2.5,
-        label="Random baseline RMSE (mean)",
+        label="Tilfældig baseline RMSE (mean)",
     )
 
     axes[1].fill_between(
         random_summary_df["labeled_size"],
         random_summary_df["random_rmse_mean"] - random_summary_df["random_rmse_std"],
         random_summary_df["random_rmse_mean"] + random_summary_df["random_rmse_std"],
+        color="orange",
         alpha=0.2,
-        label="Random baseline ±1 std",
+        label="Tilfældig baseline ±1 std",
     )
 
-    axes[1].set_title("QBC vs Random Baseline — RMSE")
-    axes[1].set_xlabel("Number of labeled samples")
+    axes[1].set_title("QBC vs Tilfældig Baseline — RMSE")
+    axes[1].set_xlabel("Antal labeled samples")
     axes[1].set_ylabel("Test RMSE")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend()
@@ -1489,8 +1520,8 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
                 label="QBC selected",
             )
 
-    axes[0].set_title("Committee predictioner på unlabeled pool")
-    axes[0].set_ylabel("Forudsagt værdi (aggregeret over 16 targets)")
+    axes[0].set_title("Komitéens forudsigelser på unlabeled pool")
+    axes[0].set_ylabel("Forudsagt værdi (aggregeret over 16 mål)")
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
@@ -1506,11 +1537,11 @@ def plot_qbc_selection(result: QBCResult, max_points: int = 120) -> None:
             selected_df["disagreement_std"],
             s=70,
             marker="o",
-            label="QBC selected",
+            label="QBC valgt",
         )
 
-    axes[1].set_title("QBC disagreement (standardafvigelse mellem modeller)")
-    axes[1].set_ylabel("Disagreement")
+    axes[1].set_title("QBC uenighed (standardafvigelse mellem modeller)")
+    axes[1].set_ylabel("Uenighed")
     axes[1].set_xlabel("Tidspunkt")
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
@@ -1535,9 +1566,9 @@ def plot_qbc_learning_curve(result: QBCResult) -> None:
     ax.plot(df["iteration"], df["test_mae"], label="MAE")
     ax.plot(df["iteration"], df["test_rmse"], label="RMSE")
 
-    ax.set_title("QBC learning curve (model performance over iterationer)")
+    ax.set_title("QBC learning curve (model performance per iteration)")
     ax.set_xlabel("Iteration")
-    ax.set_ylabel("Fejl (°C)")
+    ax.set_ylabel("Error")
     ax.legend()
     ax.grid(True, alpha=0.3)
 
@@ -1703,7 +1734,7 @@ def main() -> None:
         initial_labeled_size=QBC_INITIAL_LABELED_SIZE,
         query_batch_size=QBC_QUERY_BATCH_SIZE,
         n_queries=QBC_N_QUERIES,
-        random_state=QBC_RANDOM_STATE,
+        random_state=INITIAL_RANDOM_STATE,
     )
 
     logging.info(f"\n⏳ Plotting QBC results...")
@@ -1775,14 +1806,14 @@ def main() -> None:
         query_batch_size=QBC_QUERY_BATCH_SIZE,
         n_queries=QBC_N_QUERIES,
         base_random_state=100,
-        n_repeats=10,
+        n_repeats=NUM_OF_REPS,
     )
     
     logging.info(f"\n⏳ Plotting QBC vs Random Baseline...")
     plot_qbc_vs_random(
         qbc_result.learning_curve,
         random_summary_df,
-        save_path="plots/qbc_vs_random_baseline.png",
+        save_path=f"plots/{timestamp}/qbc_vs_random_baseline.png",
     )
     
     # Save results to CSV files
@@ -1873,7 +1904,7 @@ def main() -> None:
     logging.info("\nPlot files created:")
     logging.info(f"  • plots/{timestamp}/qbc_learning_curve.png")
     logging.info(f"  • plots/{timestamp}/qbc_selection.png")
-    logging.info(f"  • plots/qbc_vs_random_baseline.png")
+    logging.info(f"  • plots/{timestamp}/qbc_vs_random_baseline.png")
 
 
 if __name__ == "__main__":
